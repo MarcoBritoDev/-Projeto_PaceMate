@@ -1,0 +1,202 @@
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "MAX30100_PulseOximeter.h"
+#include <NMEAGPS.h> // Biblioteca NeoGPS
+#include <HardwareSerial.h>
+#include <TimeLib.h> // Biblioteca para lidar com horário
+#include <ESPAsyncWebServer.h>
+
+// Configurações da Rede Wi-Fi
+const char* ssid = "Iphone de Marco";  // SSID da rede
+const char* password = "oijoao123";    // Senha da rede
+
+// Configurações do display OLED e do MAX30100
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET    -1
+Adafruit_SSD1306 OLED(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Servidor Web
+AsyncWebServer server(80);
+
+// Variáveis globais
+boolean corridaIniciada = false; // Estado da corrida
+unsigned long startTime = 0; // Tempo de início da corrida
+unsigned long currentTime = 0;
+float totalDistance = 0; // Distância total percorrida em metros
+float prevLat = 0, prevLon = 0; // Para armazenar a última posição válida
+float bpm = 0; // Valor do BPM
+float pace = 0.00; // Ritmo
+
+// Definições do GPS e sensor
+PulseOximeter max_sensor;
+NMEAGPS gps;
+gps_fix fix;
+HardwareSerial GPS_Serial(2); // Usando UART2 (TX2=GPIO 17, RX2=GPIO 16)
+
+// Função para calcular a distância entre dois pontos de GPS utilizando a fórmula de Haversine
+float calculateDistance(float lat1, float lon1, float lat2, float lon2) {
+  const float R = 6371000; // Raio da Terra em metros
+  float latRad1 = radians(lat1);
+  float latRad2 = radians(lat2);
+  float deltaLat = radians(lat2 - lat1);
+  float deltaLon = radians(lon2 - lon1);
+
+  float a = sin(deltaLat / 2) * sin(deltaLat / 2) +
+            cos(latRad1) * cos(latRad2) *
+            sin(deltaLon / 2) * sin(deltaLon / 2);
+
+  float c = 2 * atan2(sqrt(a), sqrt(1 - a));
+  float distance = R * c; // Distância em metros
+  return distance;
+}
+
+// Função para desenhar o cronômetro no OLED
+void exibirCronometro() {
+  currentTime = millis() - startTime; // Calcula o tempo decorrido
+  int segundos = (currentTime / 1000) % 60;
+  int minutos = (currentTime / 60000) % 60;
+  int horas = currentTime / 3600000;
+
+  OLED.setCursor(0, 0);
+  if (horas < 10) OLED.print("0");
+  OLED.print(horas);
+  OLED.print(":");
+  if (minutos < 10) OLED.print("0");
+  OLED.print(minutos);
+  OLED.print(":");
+  if (segundos < 10) OLED.print("0");
+  OLED.println(segundos);
+  OLED.display();
+}
+
+// Função chamada quando o botão "Iniciar Corrida" for clicado
+void iniciarCorrida() {
+  corridaIniciada = true;
+  startTime = millis(); // Marca o início da corrida
+}
+
+// Função chamada para zerar o cronômetro
+void resetCronometro() {
+  startTime = millis();  // Zera o tempo do cronômetro
+}
+
+// Setup
+void setup() {
+  Serial.begin(115200);
+
+  // Conectar ao Wi-Fi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Conectando ao Wi-Fi...");
+  }
+  Serial.println("Conectado ao Wi-Fi");
+
+  // Inicializar o servidor web
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    String html = "<!DOCTYPE html><html><body>";
+    html += "<h1>Controle da Corrida</h1>";
+    html += "<button onclick=\"window.location.href='/start'\">Iniciar Corrida</button>";
+    html += "<button onclick=\"window.location.href='/reset'\">Zerar Timer</button>";
+    html += "<h2>Informacoes:</h2>";
+    html += "<p>Tempo: " + String((millis() - startTime) / 1000) + " s</p>";
+    html += "<p>BPM: " + String(bpm) + "</p>";
+    html += "<p>Distancia: " + String(totalDistance / 1000, 2) + " km</p>";
+    html += "<p>Ritmo: " + String(pace, 2) + " min/km</p>";
+    html += "</body></html>";
+    request->send(200, "text/html", html);
+  });
+
+  // Endpoint para iniciar a corrida
+  server.on("/start", HTTP_GET, [](AsyncWebServerRequest *request){
+    iniciarCorrida(); // Inicia a corrida
+    request->send(200, "text/html", "<h1>Corrida Iniciada!</h1><p>Você pode voltar para a página inicial e ver o cronômetro no OLED.</p>");
+  });
+
+  // Endpoint para zerar o cronômetro
+  server.on("/reset", HTTP_GET, [](AsyncWebServerRequest *request){
+    resetCronometro(); // Zera o cronômetro
+    request->send(200, "text/html", "<h1>Timer Zerado!</h1><p>Você pode voltar para a página inicial e ver o cronômetro no OLED zerado.</p>");
+  });
+
+  server.begin();
+
+  // Inicialização do display OLED
+  if (!OLED.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Falha ao inicializar OLED");
+    while (1);
+  }
+  OLED.clearDisplay();
+  OLED.setTextSize(1);
+  OLED.setTextColor(SSD1306_WHITE);
+
+  // Inicialização do sensor MAX30100
+  Serial.print("Inicializando pulse oximeter...");
+  if (!max_sensor.begin()) {
+    Serial.println("Falhou");
+    while (1);
+  } else {
+    Serial.println("Sucesso");
+  }
+  max_sensor.setOnBeatDetectedCallback(onBeatDetected);
+
+  // Inicialização do GPS
+  GPS_Serial.begin(9600, SERIAL_8N1, 16, 17); // Configurando comunicação com o GPS
+  Serial.println("GPS initialized");
+}
+
+// Função de callback para quando o batimento for detectado
+void onBeatDetected() {
+   Serial.println("Beat!");
+}
+
+// Loop
+void loop() {
+  // Atualiza os dados do sensor de oximetria
+  max_sensor.update();
+  bpm = max_sensor.getHeartRate();
+
+  // Atualiza os dados do GPS
+  while (GPS_Serial.available() > 0) {
+    if (gps.decode(GPS_Serial.read())) {
+      fix = gps.read();
+      if (fix.valid.location) {
+        if (prevLat != 0 && prevLon != 0) {
+          float distance = calculateDistance(prevLat, prevLon, fix.latitude(), fix.longitude());
+          totalDistance += distance;
+        }
+        prevLat = fix.latitude();
+        prevLon = fix.longitude();
+      }
+      if (fix.valid.speed) {
+        pace = 60 / (fix.speed_kph() / 3.6); // Calcula o ritmo (min/km)
+      }
+    }
+  }
+
+  // Exibe as informações no OLED
+  OLED.clearDisplay();
+  if (corridaIniciada) {
+    exibirCronometro(); // Exibe o cronômetro no OLED
+  }
+
+  OLED.setCursor(0, 8);
+  OLED.print("BPM: ");
+  OLED.println(bpm);
+  
+  OLED.setCursor(0, 16);
+  OLED.print("Dist: ");
+  OLED.print(totalDistance / 1000, 2); // Exibe a distância em km
+  OLED.println(" km");
+
+  OLED.setCursor(0, 24);
+  OLED.print("Ritmo: ");
+  OLED.print(pace, 2);
+  OLED.println(" min/km");
+
+  OLED.display();
+}
+
